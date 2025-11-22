@@ -23,7 +23,7 @@ from utils.metrics import Evaluator
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 def parse_args(args):
-    parser = argparse.ArgumentParser(description="LISA Model Training")
+    parser = argparse.ArgumentParser(description="FSVLM Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
         "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
