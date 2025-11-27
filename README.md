@@ -69,6 +69,10 @@ python train_ds.py
 ### Merge LoRA Weight
 Merge the LoRA weights of `pytorch_model.bin`, save the resulting model into your desired path in the Hugging Face format:
 ```
+cd ./runs/fsvlm/iter_train && python zero_to_fp32.py . ../pytorch_model.bin
+```
+
+```
 CUDA_VISIBLE_DEVICES="" python merge_lora_weights_and_save_hf_model.py \
   --version="PATH_TO_LLaVA" \
   --weight="PATH_TO_pytorch_model.bin" \
