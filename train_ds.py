@@ -169,6 +169,23 @@ def is_better_checkpoint(metrics, best_metrics):
     return False
 
 
+def get_current_lr(optimizer, scheduler):
+    if scheduler is not None:
+        last_lr = getattr(scheduler, "_last_lr", None)
+        if last_lr:
+            return last_lr[0]
+        try:
+            last_lr = scheduler.get_last_lr()
+            if last_lr:
+                return last_lr[0]
+        except AssertionError:
+            pass
+
+    if optimizer is not None and getattr(optimizer, "param_groups", None):
+        return optimizer.param_groups[0]["lr"]
+    return None
+
+
 def main(args):
     args = parse_args(args)
     env_local_rank = os.environ.get("LOCAL_RANK")
@@ -576,7 +593,6 @@ def train(
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
             output_dict = model(**input_dict)
-            print(input_dict["image_paths"])
             loss = output_dict["loss"]
             ce_loss = output_dict["ce_loss"]
             mask_bce_loss = output_dict["mask_bce_loss"]
@@ -633,9 +649,9 @@ def train(
             mask_losses.reset()
 
         if global_step != 0:
-            curr_lr = scheduler.get_last_lr()
-            if args.local_rank == 0:
-                writer.add_scalar("train/lr", curr_lr[0], global_step)
+            curr_lr = get_current_lr(optimizer, scheduler)
+            if args.local_rank == 0 and curr_lr is not None:
+                writer.add_scalar("train/lr", curr_lr, global_step)
 
     return train_iter
 
