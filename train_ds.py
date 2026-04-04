@@ -146,6 +146,9 @@ def is_better_checkpoint(metrics, best_metrics):
 
 def main(args):
     args = parse_args(args)
+    env_local_rank = os.environ.get("LOCAL_RANK")
+    if env_local_rank is not None:
+        args.local_rank = int(env_local_rank)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     args.val_metrics_path = os.path.join(args.log_dir, "val_metrics.csv")
     if is_main_process(args):
@@ -383,6 +386,7 @@ def main(args):
             local_rank=args.local_rank,
         ),
         config=ds_config,
+        dist_init_required=args.distributed,
     )
     print( ' train_loader:',train_loader)
   
