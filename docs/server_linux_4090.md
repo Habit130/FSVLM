@@ -12,7 +12,7 @@ The repository assumes the dataset lives next to the repository root:
 - dataset: `../plantseg/`
 
 ## Required external assets
-- Llama 2 7B base model on Hugging Face
+- Llama 2 7B base model downloaded locally from ModelScope and passed as `--model_base`
 - `liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview`
 - `openai/clip-vit-large-patch14`
 - SAM ViT-H checkpoint file
@@ -44,7 +44,7 @@ python train_ds.py \
   --caption_index 3 \
   --target_name "diseased region" \
   --version liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview \
-  --model_base meta-llama/Llama-2-7b-hf \
+  --model_base /path/to/Llama-2-7b-ms \
   --vision_pretrained /path/to/sam_vit_h_4b8939.pth
 ```
 
@@ -54,7 +54,7 @@ The supported weight merge command surface is:
 ```bash
 python merge_lora_weights_and_save_hf_model.py \
   --version liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview \
-  --model_base meta-llama/Llama-2-7b-hf \
+  --model_base /path/to/Llama-2-7b-ms \
   --weight /path/to/pytorch_model.bin \
   --vision_pretrained /path/to/sam_vit_h_4b8939.pth \
   --save_path /path/to/merged_model
