@@ -43,8 +43,9 @@ python train_ds.py \
   --val_split val \
   --caption_index 3 \
   --target_name "diseased region" \
+  --precision bf16 \
   --version liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview \
-  --model_base /path/to/Llama-2-7b-ms \
+  --model_base /path/to/Llama-2-7b-hf \
   --vision_pretrained /path/to/sam_vit_h_4b8939.pth
 ```
 
@@ -54,7 +55,7 @@ The supported weight merge command surface is:
 ```bash
 python merge_lora_weights_and_save_hf_model.py \
   --version liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview \
-  --model_base /path/to/Llama-2-7b-ms \
+  --model_base /path/to/Llama-2-7b-hf \
   --weight /path/to/pytorch_model.bin \
   --vision_pretrained /path/to/sam_vit_h_4b8939.pth \
   --save_path /path/to/merged_model

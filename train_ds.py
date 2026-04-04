@@ -39,7 +39,7 @@ def parse_args(args):
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="bf16",
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
@@ -100,6 +100,7 @@ def parse_args(args):
     )
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
+    parser.add_argument("--master_port", default=29500, type=int)
     parser.add_argument("--print_freq", default=1, type=int)
     parser.add_argument("--start_epoch", default=0, type=int)
     parser.add_argument("--gradient_checkpointing", action="store_true", default=True)
@@ -137,7 +138,7 @@ def ensure_distributed_backend(args):
         return
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("MASTER_PORT", str(args.master_port))
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     os.environ.setdefault("LOCAL_RANK", str(args.local_rank))
@@ -186,11 +187,69 @@ def get_current_lr(optimizer, scheduler):
     return None
 
 
+def build_deepspeed_config(args):
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "gradient_accumulation_steps": args.grad_accumulation_steps,
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": args.lr,
+                "weight_decay": 0.0,
+                "betas": (args.beta1, args.beta2),
+                "torch_adam": True,
+            },
+        },
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "total_num_steps": args.epochs * args.steps_per_epoch,
+                "warmup_min_lr": 0,
+                "warmup_max_lr": args.lr,
+                "warmup_num_steps": 100,
+                "warmup_type": "linear",
+            },
+        },
+        "fp16": {
+            "enabled": args.precision == "fp16",
+            "loss_scale": 0,
+            "initial_scale_power": 12,
+            "loss_scale_window": 1000,
+            "hysteresis": 2,
+            "min_loss_scale": 1,
+        },
+        "bf16": {
+            "enabled": args.precision == "bf16",
+        },
+        "gradient_clipping": 1.0,
+        "log_dir": "./deepspeed_logs/",
+    }
+
+    zero_stage = 2 if args.distributed else 0
+    if zero_stage > 0:
+        ds_config["zero_optimization"] = {
+            "stage": zero_stage,
+            "contiguous_gradients": True,
+            "overlap_comm": True,
+            "reduce_scatter": True,
+            "reduce_bucket_size": 5e8,
+            "allgather_bucket_size": 5e8,
+        }
+    else:
+        ds_config["zero_optimization"] = {"stage": 0}
+
+    return ds_config
+
+
 def main(args):
     args = parse_args(args)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     env_local_rank = os.environ.get("LOCAL_RANK")
     if env_local_rank is not None:
         args.local_rank = int(env_local_rank)
+    args.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    args.distributed = args.world_size > 1
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
     args.val_metrics_path = os.path.join(args.log_dir, "val_metrics.csv")
     if is_main_process(args):
@@ -256,8 +315,14 @@ def main(args):
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
 
-    model.enable_input_require_grads()
-    model.gradient_checkpointing_enable()
+    if args.gradient_checkpointing:
+        model.enable_input_require_grads()
+        try:
+            model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            model.gradient_checkpointing_enable()
 
     model.get_model().initialize_vision_modules(model.get_model().config)
     vision_tower = model.get_model().get_vision_tower()
@@ -337,8 +402,6 @@ def main(args):
             p.requires_grad = True
    
 
-    world_size = max(1, torch.cuda.device_count())
-    args.distributed = world_size > 1
     ensure_distributed_backend(args)
  
     train_dataset = HybridDataset(
@@ -348,7 +411,7 @@ def main(args):
         samples_per_epoch=args.batch_size
         * args.grad_accumulation_steps
         * args.steps_per_epoch
-        * world_size,
+        * args.world_size,
         precision=args.precision,
         image_size=args.image_size,
         num_classes_per_sample=args.num_classes_per_sample,
@@ -378,45 +441,7 @@ def main(args):
         val_dataset = None
         print(f"Training with {len(train_dataset)} examples.")
  
-    ds_config = {
-        "train_micro_batch_size_per_gpu": args.batch_size,
-        "gradient_accumulation_steps": args.grad_accumulation_steps,
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": args.lr,
-                "weight_decay": 0.0,
-                "betas": (args.beta1, args.beta2),
-                "torch_adam": True,
-            },
-        },
-        "scheduler": {
-            "type": "WarmupDecayLR",
-            "params": {
-                "total_num_steps": args.epochs * args.steps_per_epoch,
-                "warmup_min_lr": 0,
-                "warmup_max_lr": args.lr,
-                "warmup_num_steps": 100,
-                "warmup_type": "linear",
-            },
-        },
-        "fp16": {
-            "enabled": args.precision == "fp16",
-        },
-        "bf16": {
-            "enabled": args.precision == "bf16",
-        },
-        "gradient_clipping": 1.0,
-        "zero_optimization": {
-            "stage": 2,
-            "contiguous_gradients": True,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 5e8,
-            "allgather_bucket_size": 5e8,
-        },
-        "log_dir": "./deepspeed_logs/"
-    }
+    ds_config = build_deepspeed_config(args)
 
     model_engine, optimizer, train_loader, scheduler = deepspeed.initialize(
         model=model,
@@ -649,7 +674,7 @@ def train(
             mask_losses.reset()
 
         if global_step != 0:
-            curr_lr = get_current_lr(optimizer, scheduler)
+            curr_lr = get_current_lr(getattr(model, "optimizer", None), scheduler)
             if args.local_rank == 0 and curr_lr is not None:
                 writer.add_scalar("train/lr", curr_lr, global_step)
 
