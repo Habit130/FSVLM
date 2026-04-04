@@ -124,6 +124,31 @@ def maybe_barrier():
         dist.barrier()
 
 
+def ensure_distributed_backend(args):
+    if not torch.cuda.is_available():
+        return
+
+    torch.cuda.set_device(args.local_rank)
+
+    if dist.is_available() and dist.is_initialized():
+        return
+
+    if args.distributed:
+        return
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29500")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", str(args.local_rank))
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        rank=0,
+        world_size=1,
+    )
+
+
 def append_metrics_row(csv_path, row):
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
     file_exists = os.path.exists(csv_path)
@@ -297,6 +322,7 @@ def main(args):
 
     world_size = max(1, torch.cuda.device_count())
     args.distributed = world_size > 1
+    ensure_distributed_backend(args)
  
     train_dataset = HybridDataset(
         args.dataset_dir,
