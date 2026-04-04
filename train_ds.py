@@ -370,6 +370,7 @@ def main(args):
                 "lr": args.lr,
                 "weight_decay": 0.0,
                 "betas": (args.beta1, args.beta2),
+                "torch_adam": True,
             },
         },
         "scheduler": {
