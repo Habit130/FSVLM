@@ -1,30 +1,73 @@
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_PATCH_TOKEN,DEFAULT_IMAGE_VISION_START,
-DEFAULT_IMAGE_VISION_END,
-DEFAULT_IMAGE_PAD,
-)
+import json
 import os
 import random
-import json
+
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from pycocotools import mask
+from PIL import Image
 from transformers import CLIPImageProcessor
-import glob
+
 from model.llava import conversation as conversation_lib
 from model.segment_anything.utils.transforms import ResizeLongestSide
-from PIL import Image
-from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
-import re
-def init_farmsegvl(base_image_dir):
 
-    images=glob.glob(os.path.join(base_image_dir,"train","img","*.png"))
-    masks=[x.replace("img","lbl") for x in images]
-    texts=[x.replace("img","json") for x in images]
-    texts=[x.replace(".png",".json") for x in texts]
-    return texts, images, masks
+from .utils import ANSWER_LIST, SHORT_QUESTION_LIST
+
+
+def _resolve_data_root(base_image_dir):
+    return os.path.abspath(base_image_dir)
+
+
+def load_plantseg_records(base_image_dir, split, caption_index=3):
+    data_root = _resolve_data_root(base_image_dir)
+    metadata_path = os.path.join(data_root, "main.json")
+    if not os.path.exists(metadata_path):
+        raise FileNotFoundError(f"PlantSeg metadata not found: {metadata_path}")
+
+    with open(metadata_path, "r", encoding="utf-8") as handle:
+        samples = json.load(handle)
+
+    records = []
+    for sample in samples:
+        if sample.get("split") != split:
+            continue
+
+        captions = sample.get("caption") or []
+        if len(captions) <= caption_index:
+            sample_id = sample.get("id", "<unknown>")
+            raise ValueError(
+                f"Sample {sample_id} is missing caption[{caption_index}] in {metadata_path}"
+            )
+
+        image_path = os.path.join(data_root, sample["image"])
+        mask_path = os.path.join(data_root, sample["mask"])
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"PlantSeg image not found: {image_path}")
+        if not os.path.exists(mask_path):
+            raise FileNotFoundError(f"PlantSeg mask not found: {mask_path}")
+
+        records.append(
+            {
+                "id": sample.get("id"),
+                "image_path": image_path,
+                "mask_path": mask_path,
+                "caption": captions[caption_index].strip(),
+                "disease_label": sample.get("disease_label", "plant disease"),
+                "split": split,
+            }
+        )
+
+    if not records:
+        raise ValueError(f"No PlantSeg samples found for split={split} in {metadata_path}")
+
+    return records
+
+
+def build_segmentation_question(text, target_name):
+    question_template = random.choice(SHORT_QUESTION_LIST)
+    return question_template.format(text_name=text, class_name=target_name)
+
 
 class orginDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
@@ -42,37 +85,39 @@ class orginDataset(torch.utils.data.Dataset):
         image_size: int = 224,
         num_classes_per_sample: int = 3,
         exclude_val=False,
-        sem_seg_data="farmsegvl",
+        sem_seg_data="plantseg",
+        split="train",
+        caption_index=3,
+        target_name="diseased region",
     ):
         self.exclude_val = exclude_val
         self.samples_per_epoch = samples_per_epoch
         self.num_classes_per_sample = num_classes_per_sample
-
-        self.base_image_dir = base_image_dir
+        self.base_image_dir = _resolve_data_root(base_image_dir)
         self.image_size = image_size
         self.tokenizer = tokenizer
         self.precision = precision
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
-
-        self.short_question_list = SHORT_QUESTION_LIST
         self.answer_list = ANSWER_LIST
-        self.data2list = {}
-        self.sem_seg_datas = sem_seg_data
-        ds =self.sem_seg_datas
-        text, images, labels = eval("init_{}".format(ds))(base_image_dir)
-        self.data2list[ds] = (text, images, labels)
-        self.length=len(images)
-        print('len(images):',len(images))
+        self.target_name = target_name
+
+        if sem_seg_data not in {"plantseg", "farmsegvl"}:
+            raise ValueError(f"Unsupported dataset name: {sem_seg_data}")
+
+        self.records = load_plantseg_records(
+            self.base_image_dir,
+            split=split,
+            caption_index=caption_index,
+        )
+        self.length = len(self.records)
+        print(f"{split} samples: {self.length}")
+
     def __len__(self):
         return self.samples_per_epoch
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize pixel values and pad to a square input."""
-        # Normalize colors
         x = (x - self.pixel_mean) / self.pixel_std
-
-        # Pad
         h, w = x.shape[-2:]
         padh = self.img_size - h
         padw = self.img_size - w
@@ -80,56 +125,36 @@ class orginDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        ds = self.sem_seg_datas
-        texts,images, labels= self.data2list[ds]
-        # print("refer: ", len(image))
-        idx = random.randint(0, len(images) - 1)
-        image_path = images[idx]
-        label_path = labels[idx]
-        text_path=texts[idx]
-        with open(text_path, "r", encoding="utf-8") as f:
-            data = json.load(f) 
-        # f = open(text_path, encoding = 'utf-8')
-        # path=f.read()
-        text =data['img_description_eg']
-        sampled_classes=text
-        questions = []
-        answers = []
-        text = text.strip()
-        assert len(text.split("||")) == 1
-        question_template = random.choice(self.short_question_list)
-        questions.append(question_template.format(text_name=text,class_name="farmland"))
-        answers.append(random.choice(self.answer_list))
+        record = self.records[random.randint(0, self.length - 1)]
+        image_path = record["image_path"]
+        label_path = record["mask_path"]
+        text = record["caption"]
+        sampled_classes = text
 
-        conversations = []
+        question = build_segmentation_question(text, self.target_name)
+        answer = random.choice(self.answer_list)
+
         conv = conversation_lib.default_conversation.copy()
-
-        i = 0
-        while i < len(questions):
-            conv.messages = []
-            conv.append_message(conv.roles[0], questions[i])
-            conv.append_message(conv.roles[1], answers[i])
-            conversations.append(conv.get_prompt())
-            i += 1
+        conv.messages = []
+        conv.append_message(conv.roles[0], question)
+        conv.append_message(conv.roles[1], answer)
+        conversations = [conv.get_prompt()]
+        questions = [question]
 
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        # preprocess image for clip
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
             "pixel_values"
         ][0]
 
-        image = self.transform.apply_image(image)  # preprocess image for sam
+        image = self.transform.apply_image(image)
         resize = image.shape[:2]
         image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
-        flag = False
         mask = Image.open(label_path)
         masks = np.array(mask)
-        # masks=masks.max(axis=2)
-        masks[masks!=0]=1
-        masks =  masks[np.newaxis,:,:]
-        # masks = np.stack(masks, axis=0)
+        masks[masks != 0] = 1
+        masks = masks[np.newaxis, :, :]
         masks = torch.from_numpy(masks)
         label = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         return (

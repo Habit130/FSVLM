@@ -9,9 +9,9 @@ import torch
 import torch.nn.functional as F
 import transformers
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
 
 from model.FSVLM import FSVLMForCausalLM
+from utils.model_loading import load_fsvlm_model
 from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN
 
 
@@ -21,6 +21,12 @@ def parse_args(args):
     )
     parser.add_argument(
         "--version", default=" "
+    )
+    parser.add_argument(
+        "--model_base",
+        default="",
+        type=str,
+        help="Optional base model path when --version points to a LoRA preview repo.",
     )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
@@ -46,7 +52,7 @@ def parse_args(args):
     parser.add_argument("--use_mm_start_end", action="store_true", default=True)
     parser.add_argument(
         "--conv_type",
-        default="llava_v1",
+        default="llava_llama_2",
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
@@ -59,16 +65,19 @@ def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
 
-    # Create model
+    tokenizer_kwargs = {
+        "cache_dir": None,
+        "model_max_length": args.model_max_length,
+        "padding_side": "right",
+        "use_fast": False,
+    }
+    tokenizer_source = args.model_base if args.model_base else args.version
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.version,
-        cache_dir=None,
-        model_max_length=args.model_max_length,
-        padding_side="right",
-        use_fast=False,
+        tokenizer_source,
+        **tokenizer_kwargs,
     )
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens("[SEG]")
+    tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
     if args.use_mm_start_end:
@@ -81,6 +90,8 @@ def main(args):
         "out_dim": args.out_dim,
         "seg_token_idx": args.seg_token_idx,
         "vision_tower": args.vision_tower,
+        "vision_pretrained": args.vision_pretrained,
+        "use_mm_start_end": args.use_mm_start_end,
     }
 
     torch_dtype = torch.float32
@@ -88,9 +99,21 @@ def main(args):
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
-    model = FSVLMForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    tokenizer, model = load_fsvlm_model(
+        args.version,
+        model_kwargs=model_args,
+        tokenizer_kwargs=tokenizer_kwargs,
+        model_base=args.model_base or None,
+        torch_dtype=torch_dtype,
     )
+    tokenizer.pad_token = tokenizer.unk_token
+    tokenizer.add_tokens("[SEG]")
+    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    if args.use_mm_start_end:
+        tokenizer.add_tokens(
+            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+        )
+    model.seg_token_idx = args.seg_token_idx
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id

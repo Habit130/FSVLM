@@ -8,30 +8,38 @@ import csv
 import deepspeed
 import numpy as np
 import torch
+import torch.distributed as dist
 import tqdm
 import transformers
 from peft import LoraConfig, get_peft_model
 from torch.utils.tensorboard import SummaryWriter
 from model.FSVLM import FSVLMForCausalLM
 from model.llava import conversation as conversation_lib
-from utils.dataset import HybridDataset, ValDataset, collate_fn,save_mask
+from utils.dataset import HybridDataset, ValDataset, collate_fn, save_mask
+from utils.model_loading import load_fsvlm_model
+from utils.server_metrics import Evaluator
 from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
                          AverageMeter, ProgressMeter, Summary, dict_to_cuda,
                          intersectionAndUnionGPU)
-from utils.generate_pic import generate_png
-from utils.metrics import Evaluator
 
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 def parse_args(args):
     parser = argparse.ArgumentParser(description="FSVLM Model Training")
     parser.add_argument("--local_rank", default=0, type=int, help="node rank")
     parser.add_argument(
-        "--version", default="liuhaotian/llava-llama-2-13b-chat-lightning-preview"
-    )   ###
+        "--version",
+        default="liuhaotian/llava-llama-2-7b-chat-lightning-lora-preview",
+    )
+    parser.add_argument(
+        "--model_base",
+        default="meta-llama/Llama-2-7b-hf",
+        type=str,
+        help="Base Llama checkpoint when --version points to a LoRA preview repo.",
+    )
     parser.add_argument("--vis_save_path", default="./vis_output", type=str)
     parser.add_argument(
         "--precision",
-        default="bf16",
+        default="fp16",
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
@@ -41,33 +49,37 @@ def parse_args(args):
     parser.add_argument("--lora_r", default=8, type=int) 
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
-    ) #"openai/clip-vit-large-patch14"
+    )
 
-    # parser.add_argument("--encode_type", default="clip-vit-L")
+    parser.add_argument("--encode_type", default="clip-vit", type=str)
 
     parser.add_argument("--load_in_8bit", action="store_true", default=False)
     parser.add_argument("--load_in_4bit", action="store_true", default=False)
     parser.add_argument(
-        "--dataset", default="farmsegvl", type=str
-    ) #||orgin||sem_seg||aug_compe
+        "--dataset", default="plantseg", type=str
+    )
     parser.add_argument("--sample_rates", default="1", type=str)
-    parser.add_argument("--farmland_seg_data", default="farmsegvl", type=str)
-    parser.add_argument("--val_dataset", default="dyour data root path", type=str)
-    parser.add_argument("--dataset_dir", default="your data root path", type=str)
+    parser.add_argument("--farmland_seg_data", default="plantseg", type=str)
+    parser.add_argument("--train_split", default="train", type=str)
+    parser.add_argument("--val_split", default="val", type=str)
+    parser.add_argument("--test_split", default="test", type=str)
+    parser.add_argument("--caption_index", default=3, type=int)
+    parser.add_argument("--target_name", default="diseased region", type=str)
+    parser.add_argument("--dataset_dir", default="../plantseg", type=str)
     parser.add_argument("--log_base_dir", default="./runs", type=str)
     parser.add_argument("--exp_name", default="fsvlm", type=str)
     parser.add_argument("--epochs", default=10, type=int)
     parser.add_argument("--steps_per_epoch", default=1000, type=int)
     parser.add_argument(
-        "--batch_size", default=2, type=int, help="batch size per device per step"
+        "--batch_size", default=1, type=int, help="batch size per device per step"
     )
     parser.add_argument(
         "--grad_accumulation_steps",
-        default=5,
+        default=8,
         type=int,
     )
     parser.add_argument("--val_batch_size", default=1, type=int)
-    parser.add_argument("--workers", default=2, type=int)
+    parser.add_argument("--workers", default=4, type=int)
     parser.add_argument("--lr", default=0.0003, type=float)
     parser.add_argument("--ce_loss_weight", default=1.0, type=float)
     parser.add_argument("--dice_loss_weight", default=0.5, type=float)
@@ -79,12 +91,13 @@ def parse_args(args):
     parser.add_argument("--beta1", default=0.9, type=float)
     parser.add_argument("--beta2", default=0.95, type=float)
     parser.add_argument("--num_classes_per_sample", default=3, type=int)
-    parser.add_argument("--exclude_val", action="store_true", default=False)
     parser.add_argument("--no_eval", action="store_true", default=False)
     parser.add_argument("--eval_only", action="store_true", default=False)
-    parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H/sam_vit_h_4b8939.pth", type=str)  ###
-    # parser.add_argument("--RSCLIP_weight_path", default="/opt/data/private/FSVLM1.0/RS5MVIT/RS5M_ViT-H-14.pt", type=str)  ###
-    # parser.add_argument("--GeoRS_path", default="/opt/data/private/FSVLM1.0/RS5Model/open_clip_pytorch_model.bin", type=str)  ###
+    parser.add_argument(
+        "--vision_pretrained",
+        default="PATH_TO_SAM_ViT-H/sam_vit_h_4b8939.pth",
+        type=str,
+    )
     parser.add_argument("--out_dim", default=256, type=int)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -95,32 +108,70 @@ def parse_args(args):
     parser.add_argument("--auto_resume", action="store_true", default=True)
     parser.add_argument(
         "--conv_type",
-        default="llava_v1",
+        default="llava_llama_2",
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
     return parser.parse_args(args)
 
 
+def is_main_process(args):
+    return args.local_rank == 0
+
+
+def maybe_barrier():
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def append_metrics_row(csv_path, row):
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, mode="a", newline="") as file:
+        writer = csv.writer(file)
+        if not file_exists:
+            writer.writerow(["epoch", "IoU", "Dice", "Recall", "mIoU", "mACC"])
+        writer.writerow(row)
+
+
+def is_better_checkpoint(metrics, best_metrics):
+    if best_metrics is None:
+        return True
+    if metrics["mIoU"] > best_metrics["mIoU"]:
+        return True
+    if metrics["mIoU"] == best_metrics["mIoU"] and metrics["IoU"] > best_metrics["IoU"]:
+        return True
+    return False
+
+
 def main(args):
     args = parse_args(args)
     args.log_dir = os.path.join(args.log_base_dir, args.exp_name)
-    if args.local_rank == 0:
+    args.val_metrics_path = os.path.join(args.log_dir, "val_metrics.csv")
+    if is_main_process(args):
         os.makedirs(args.log_dir, exist_ok=True)
         writer = SummaryWriter(args.log_dir)
     else:
         writer = None
 
-    # Create model
+    torch_dtype = torch.float32
+    if args.precision == "bf16":
+        torch_dtype = torch.bfloat16
+    elif args.precision == "fp16":
+        torch_dtype = torch.half
+
+    tokenizer_kwargs = {
+        "cache_dir": None,
+        "model_max_length": args.model_max_length,
+        "padding_side": "right",
+        "use_fast": False,
+    }
+    tokenizer_source = args.model_base if args.model_base else args.version
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        args.version,
-        cache_dir=None,
-        model_max_length=args.model_max_length,
-        padding_side="right",
-        use_fast=False,
+        tokenizer_source, **tokenizer_kwargs
     )
     tokenizer.pad_token = tokenizer.unk_token
-    num_added_tokens = tokenizer.add_tokens("[SEG]")
+    tokenizer.add_tokens("[SEG]")
     args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
 
     if args.use_mm_start_end:
@@ -140,14 +191,22 @@ def main(args):
         "use_mm_start_end": args.use_mm_start_end,
     }
 
-    torch_dtype = torch.float32
-    if args.precision == "bf16":
-        torch_dtype = torch.bfloat16
-    elif args.precision == "fp16":
-        torch_dtype = torch.half
-    model = FSVLMForCausalLM.from_pretrained(
-        args.version, torch_dtype=torch_dtype, low_cpu_mem_usage=True, **model_args
+    tokenizer, model = load_fsvlm_model(
+        args.version,
+        model_kwargs=model_args,
+        tokenizer_kwargs=tokenizer_kwargs,
+        model_base=args.model_base,
+        torch_dtype=torch_dtype,
     )
+    tokenizer.pad_token = tokenizer.unk_token
+    tokenizer.add_tokens("[SEG]")
+    args.seg_token_idx = tokenizer("[SEG]", add_special_tokens=False).input_ids[0]
+    if args.use_mm_start_end:
+        tokenizer.add_tokens(
+            [DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN], special_tokens=True
+        )
+    model.seg_token_idx = args.seg_token_idx
+
     model.config.eos_token_id = tokenizer.eos_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.pad_token_id = tokenizer.pad_token_id
@@ -233,7 +292,7 @@ def main(args):
             p.requires_grad = True
    
 
-    world_size = torch.cuda.device_count()
+    world_size = max(1, torch.cuda.device_count())
     args.distributed = world_size > 1
  
     train_dataset = HybridDataset(
@@ -247,20 +306,24 @@ def main(args):
         precision=args.precision,
         image_size=args.image_size,
         num_classes_per_sample=args.num_classes_per_sample,
-        exclude_val=args.exclude_val,
         dataset=args.dataset,
         sample_rate=[float(x) for x in args.sample_rates.split(",")],
         seg_data=args.farmland_seg_data,
         explanatory=args.explanatory,
+        split=args.train_split,
+        caption_index=args.caption_index,
+        target_name=args.target_name,
     )
 
-    if args.no_eval == False:
+    if args.no_eval is False:
         val_dataset = ValDataset(
             args.dataset_dir,
             tokenizer,
             args.vision_tower,
-            args.val_dataset,
-            args.image_size,
+            split=args.val_split,
+            image_size=args.image_size,
+            caption_index=args.caption_index,
+            target_name=args.target_name,
         )
         print(
             f"Training with {len(train_dataset)} examples and validating with {len(val_dataset)} examples."
@@ -344,13 +407,16 @@ def main(args):
     # validation dataset
     if val_dataset is not None:
         assert args.val_batch_size == 1
-        val_sampler = torch.utils.data.distributed.DistributedSampler(
-            val_dataset, shuffle=False, drop_last=False
-        )
+        if args.distributed:
+            val_sampler = torch.utils.data.distributed.DistributedSampler(
+                val_dataset, shuffle=False, drop_last=False
+            )
+        else:
+            val_sampler = None
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=args.val_batch_size,
-            shuffle=False,
+            shuffle=False if val_sampler is not None else False,
             num_workers=args.workers,
             pin_memory=False,
             sampler=val_sampler,
@@ -364,14 +430,15 @@ def main(args):
         )
 
     train_iter = iter(train_loader)
-    best_score, cur_ciou = 0.0, 0.0
+    best_metrics = None
 
     if args.eval_only:
-        giou, ciou,Acc, Acc_class, mIoU, FWIoU = validate(val_loader, model_engine, 0, writer, args)
-        exit()
-    best_mIoU=0
+        metrics = validate(val_loader, model_engine, 0, writer, args)
+        if is_main_process(args):
+            print(metrics)
+        return
+
     for epoch in range(args.start_epoch, args.epochs):
-        # train for one epoch
         train_iter = train(
             train_loader,
             model_engine,
@@ -382,37 +449,44 @@ def main(args):
             args,
         )
 
-        if args.no_eval == False:
-            giou, ciou,Acc, Acc_class, mIoU, FWIoU,dice,recall= validate(val_loader, model_engine, epoch, writer, args)
-            is_best = mIoU > best_score
-            best_score = max(mIoU, best_score)
-            cur_ciou = ciou if is_best else cur_ciou
-      
-            if best_mIoU<mIoU:
-                best_mIoU=mIoU
-            csv_filename = "./best_result/result.csv"
-            with open(csv_filename, mode='a', newline='') as file:
-                writers = csv.writer(file)
-                writers.writerow(['epoch','Accuracy', 'Accuracy_Class', 'mIoU', 'fwIoU', "mdice","mrecall"])
-                writers.writerow([epoch,Acc, Acc_class, mIoU, FWIoU, dice,recall])
+        is_best = args.no_eval
+        if args.no_eval is False:
+            metrics = validate(val_loader, model_engine, epoch, writer, args)
+            is_best = is_better_checkpoint(metrics, best_metrics)
+            if is_best:
+                best_metrics = metrics
+
+            if is_main_process(args):
+                append_metrics_row(
+                    args.val_metrics_path,
+                    [
+                        epoch,
+                        metrics["IoU"],
+                        metrics["Dice"],
+                        metrics["Recall"],
+                        metrics["mIoU"],
+                        metrics["mACC"],
+                    ],
+                )
 
         if args.no_eval or is_best:
             save_dir = os.path.join(args.log_dir, "iter_train")
-            if args.local_rank == 0:
+            if is_main_process(args):
+                best_iou = 0.0 if best_metrics is None else best_metrics["IoU"]
+                best_miou = 0.0 if best_metrics is None else best_metrics["mIoU"]
                 torch.save(
                     {"epoch": epoch},
                     os.path.join(
                         args.log_dir,
-                        "meta_log_giou{:.3f}_ciou{:.3f}.pth".format(
-                            best_score, cur_ciou
+                        "meta_log_iou{:.3f}_miou{:.3f}.pth".format(
+                            best_iou, best_miou
                         ),
                     ),
                 )
                 if os.path.exists(save_dir):
                     shutil.rmtree(save_dir)
-          
-            torch.distributed.barrier()
-           
+
+            maybe_barrier()
             model_engine.save_checkpoint(save_dir)
 
 
@@ -536,19 +610,13 @@ def train(
 
 
 def validate(val_loader, model_engine, epoch, writer, args):
-    intersection_meter = AverageMeter("Intersec", ":6.3f", Summary.SUM)
-    union_meter = AverageMeter("Union", ":6.3f", Summary.SUM)
-    acc_iou_meter = AverageMeter("gIoU", ":6.3f", Summary.SUM)
     evaluator = Evaluator(2)
     evaluator.reset()
     model_engine.eval()
-    i=0
     with torch.no_grad():
         for input_dict in tqdm.tqdm(val_loader):
             torch.cuda.empty_cache()
-            i=i+1
             input_dict = dict_to_cuda(input_dict)
-            input_dict["encode_type"]=args.encode_type
             if args.precision == "fp16":
                 input_dict["images"] = input_dict["images"].half()
                 input_dict["images_clip"] = input_dict["images_clip"].half()
@@ -558,52 +626,30 @@ def validate(val_loader, model_engine, epoch, writer, args):
             else:
                 input_dict["images"] = input_dict["images"].float()
                 input_dict["images_clip"] = input_dict["images_clip"].float()
-            print(input_dict["image_paths"])
-            with torch.no_grad():
-                output_dict = model_engine(**input_dict)
+            output_dict = model_engine(**input_dict)
 
             pred_masks = output_dict["pred_masks"]
             masks_list = output_dict["gt_masks"][0].int()
             output_list = (pred_masks[0] > 0).int()
-            evaluator.add_batch(masks_list.cpu().numpy(),output_list.cpu().numpy())
-            # generate_png(output_list.cpu().numpy(),masks_list.cpu().numpy(),i)
+            evaluator.add_batch(masks_list.cpu().numpy(), output_list.cpu().numpy())
             assert len(pred_masks) == 1
-            save_mask(pred_masks,args.vis_save_path,input_dict["image_paths"][0])
-            intersection, union, acc_iou = 0.0, 0.0, 0.0
-            for mask_i, output_i in zip(masks_list, output_list):
-                intersection_i, union_i, _ = intersectionAndUnionGPU(
-                    output_i.contiguous().clone(), mask_i.contiguous(), 2, ignore_index=255
-                )
-                intersection += intersection_i
-                union += union_i
-                acc_iou += intersection_i / (union_i + 1e-5)
-                acc_iou[union_i == 0] += 1.0  # no-object target
-            intersection, union = intersection.cpu().numpy(), union.cpu().numpy()
-            acc_iou = acc_iou.cpu().numpy() / masks_list.shape[0]
-            intersection_meter.update(intersection), union_meter.update(
-                union
-            ), acc_iou_meter.update(acc_iou, n=masks_list.shape[0])
-    Acc = evaluator.Pixel_Accuracy()
-    Acc_class = evaluator.Pixel_Accuracy_Class()
-    mIoU = evaluator.Mean_Intersection_over_Union()
-    FWIoU = evaluator.Frequency_Weighted_Intersection_over_Union()
-    IOU,dice,recall=evaluator.calculate_iou()
-    intersection_meter.all_reduce()
-    union_meter.all_reduce()
-    acc_iou_meter.all_reduce()
-    print("Acc:{}, Acc_class:{}, mIoU:{}, fwIoU: {},dice:{},recall:{}".format(Acc, Acc_class, mIoU, FWIoU,dice,recall))
-    
-    iou_class = intersection_meter.sum / (union_meter.sum + 1e-10)
-    ciou = iou_class[1]
-    giou = acc_iou_meter.avg[1]
-    
-        
-    if args.local_rank == 0:
-        writer.add_scalar("val/giou", giou, epoch)
-        writer.add_scalar("val/ciou", ciou, epoch)
-        print("giou: {:.4f}, ciou: {:.4f}".format(giou, ciou))
+            if is_main_process(args):
+                save_mask(pred_masks, args.vis_save_path, input_dict["image_paths"][0])
 
-    return giou, ciou,Acc, Acc_class, mIoU, FWIoU,dice,recall
+    metrics = evaluator.compute_metrics()
+    if is_main_process(args) and writer is not None:
+        writer.add_scalar("val/iou_fg", metrics["IoU"], epoch)
+        writer.add_scalar("val/dice_fg", metrics["Dice"], epoch)
+        writer.add_scalar("val/recall_fg", metrics["Recall"], epoch)
+        writer.add_scalar("val/miou", metrics["mIoU"], epoch)
+        writer.add_scalar("val/macc", metrics["mACC"], epoch)
+        print(
+            "IoU:{IoU:.4f}, Dice:{Dice:.4f}, Recall:{Recall:.4f}, mIoU:{mIoU:.4f}, mACC:{mACC:.4f}".format(
+                **metrics
+            )
+        )
+
+    return metrics
 
 
 if __name__ == "__main__":

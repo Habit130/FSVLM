@@ -1,55 +1,55 @@
-import glob
 import os
-import random
-from PIL import Image
+
 import cv2
 import numpy as np
+from PIL import Image
 import torch
 import torch.nn.functional as F
-from pycocotools import mask
 from transformers import CLIPImageProcessor
-import json
-import re
 
 from model.llava import conversation as conversation_lib
-from model.llava.constants import (DEFAULT_IMAGE_TOKEN, IGNORE_INDEX,
-                                   IMAGE_TOKEN_INDEX)
+from model.llava.constants import IGNORE_INDEX
 from model.llava.mm_utils import tokenizer_image_token
 from model.segment_anything.utils.transforms import ResizeLongestSide
 
-from .conversation import get_default_conv_template
-from .data_processing import get_mask_from_json
-from .orgin_dataset import orginDataset
-from .utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                    DEFAULT_IMAGE_TOKEN)
-def save_mask(pred_masks,save_path_dir,image_path):
-     if not os.path.exists(save_path_dir):
-         os.makedirs(save_path_dir)
-     image_np = cv2.imread(image_path)
-     image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-     for i, pred_mask in enumerate(pred_masks):
-            if pred_mask.shape[0] == 0:
-                continue
-            pred_mask = pred_mask.detach().cpu().numpy()[0]
-            pred_mask = pred_mask > 0
+from .orgin_dataset import (
+    build_segmentation_question,
+    load_plantseg_records,
+    orginDataset,
+)
+from .utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IMAGE_TOKEN
 
-            save_path = "{}/{}_mask_{}.png".format(
-               save_path_dir, image_path.split("/")[-1].split(".")[0], i
-            )
-            cv2.imwrite(save_path, pred_mask * 100)
-            print("{} has been saved.".format(save_path))
 
-            save_path = "{}/{}_masked_img_{}.png".format(
-               save_path_dir, image_path.split("/")[-1].split(".")[0], i
-            )
-            save_img = image_np.copy()
-            save_img[pred_mask] = (
-                image_np * 0.5
-                + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
-            )[pred_mask]
-            save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
-            cv2.imwrite(save_path, save_img)
-            print("{} has been saved.".format(save_path))
+def save_mask(pred_masks, save_path_dir, image_path):
+    if not os.path.exists(save_path_dir):
+        os.makedirs(save_path_dir)
+    image_np = cv2.imread(image_path)
+    image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
+    for i, pred_mask in enumerate(pred_masks):
+        if pred_mask.shape[0] == 0:
+            continue
+        pred_mask = pred_mask.detach().cpu().numpy()[0]
+        pred_mask = pred_mask > 0
+
+        save_path = "{}/{}_mask_{}.png".format(
+            save_path_dir, os.path.splitext(os.path.basename(image_path))[0], i
+        )
+        cv2.imwrite(save_path, pred_mask * 100)
+        print("{} has been saved.".format(save_path))
+
+        save_path = "{}/{}_masked_img_{}.png".format(
+            save_path_dir, os.path.splitext(os.path.basename(image_path))[0], i
+        )
+        save_img = image_np.copy()
+        save_img[pred_mask] = (
+            image_np * 0.5
+            + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
+        )[pred_mask]
+        save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(save_path, save_img)
+        print("{} has been saved.".format(save_path))
+
+
 def collate_fn(
     batch, tokenizer=None, conv_type="llava_v1", use_mm_start_end=True, local_rank=-1
 ):
@@ -206,10 +206,13 @@ class HybridDataset(torch.utils.data.Dataset):
         image_size: int = 224,
         num_classes_per_sample: int = 3,
         exclude_val=False,
-        dataset="farmsegvl",
-        sample_rate=[9, 3, 3, 1],
-        seg_data="FIT|LoveDA",
+        dataset="plantseg",
+        sample_rate=[1],
+        seg_data="plantseg",
         explanatory=0.1,
+        split="train",
+        caption_index=3,
+        target_name="diseased region",
     ):
         self.exclude_val = exclude_val
         self.dataset = dataset
@@ -225,8 +228,8 @@ class HybridDataset(torch.utils.data.Dataset):
         self.precision = precision
         self.datasets = dataset.split("||")
         self.all_datasets = []
-        for dataset in self.datasets:
-            if dataset == "farmsegvl":
+        for dataset_name in self.datasets:
+            if dataset_name in {"plantseg", "farmsegvl"}:
                 self.all_datasets.append(
                     orginDataset(
                         base_image_dir,
@@ -238,8 +241,13 @@ class HybridDataset(torch.utils.data.Dataset):
                         num_classes_per_sample,
                         exclude_val,
                         seg_data,
+                        split=split,
+                        caption_index=caption_index,
+                        target_name=target_name,
                     )
                 )
+            else:
+                raise ValueError(f"Unsupported dataset name: {dataset_name}")
            
     def __len__(self):
         return self.samples_per_epoch
@@ -251,11 +259,7 @@ class HybridDataset(torch.utils.data.Dataset):
         
         return *data[0], inference
 
-def load_data(base_dir):
-    #data_path
-    images=glob.glob(os.path.join(base_dir,"test","img","*.png"))
-    masks=[x.replace("img","lbl") for x in images]
-    return images,masks
+
 class ValDataset(torch.utils.data.Dataset):
     pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
     pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
@@ -267,23 +271,28 @@ class ValDataset(torch.utils.data.Dataset):
         base_image_dir,
         tokenizer,
         vision_tower,
-        val_dataset,
+        split="val",
         image_size=1024,
+        caption_index=3,
+        target_name="diseased region",
     ):
         if "ViT-L-14" in vision_tower:
-            vision_tower="openai/clip-vit-large-patch14"
+            vision_tower = "openai/clip-vit-large-patch14"
         self.base_image_dir = base_image_dir
-        self.images,self.mask=load_data(self.base_image_dir)
-        print('val:',len(self.images))
-        ds="dataset"
-        self.ds = ds
+        self.records = load_plantseg_records(
+            self.base_image_dir,
+            split=split,
+            caption_index=caption_index,
+        )
+        print(f"{split}: {len(self.records)}")
         self.image_size = image_size
         self.tokenizer = tokenizer
         self.transform = ResizeLongestSide(image_size)
         self.clip_image_processor = CLIPImageProcessor.from_pretrained(vision_tower)
+        self.target_name = target_name
 
     def __len__(self):
-        return len(self.images)
+        return len(self.records)
 
     def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize pixel values and pad to a square input."""
@@ -298,45 +307,34 @@ class ValDataset(torch.utils.data.Dataset):
         return x
 
     def __getitem__(self, idx):
-        image_path=self.images[idx]
-        # text_path=self.texts[idx]
-        # f = open(text_path, encoding = 'utf-8')
-        # path=f.read()
-        text ="This is a remote sensing image."  #json.loads(path)['img_description_eg']
-        # text="Farmland shows clear human activity, with distinct textures and geometric boundaries like field ridges and irrigation facilities."
-        conversations = []
+        record = self.records[idx]
+        image_path = record["image_path"]
+        text = record["caption"]
         conv = conversation_lib.default_conversation.copy()
-        i = 0
-        
         conv.append_message(
-                conv.roles[0],
-                DEFAULT_IMAGE_TOKEN
-                + "\n {} Can you segment the farmland in this image?.".format(text),
-                )
+            conv.roles[0],
+            DEFAULT_IMAGE_TOKEN
+            + "\n {} Can you segment the {} in this image?".format(
+                text, self.target_name
+            ),
+        )
         conv.append_message(conv.roles[1], "[SEG].")
-        conversations.append(conv.get_prompt())
-        i += 1
+        conversations = [conv.get_prompt()]
 
-        # preprocess image for clip
         image = cv2.imread(image_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         image_clip = self.clip_image_processor.preprocess(image, return_tensors="pt")[
             "pixel_values"
         ][0]
 
-        # preprocess image for sam
         image = self.transform.apply_image(image)
         resize = image.shape[:2]
         image = self.preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
 
-       
-        masks_path=self.mask[idx]
-        mask = Image.open(masks_path)
+        mask = Image.open(record["mask_path"])
         masks = np.array(mask)
-        masks[masks!=0]=1
-        # masks=masks.max(axis=2)
-        masks =  masks[np.newaxis,:,:]
-        # masks = np.stack(masks, axis=0)
+        masks[masks != 0] = 1
+        masks = masks[np.newaxis, :, :]
         masks = torch.from_numpy(masks)
         labels = torch.ones(masks.shape[1], masks.shape[2]) * self.ignore_label
         inference = True
