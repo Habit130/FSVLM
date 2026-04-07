@@ -1,26 +1,21 @@
 import argparse
+import csv
 import os
 import sys
-import deepspeed
-import cv2
-import numpy as np
+
 import torch
-import torch.nn.functional as F
-from transformers import BitsAndBytesConfig, CLIPImageProcessor
-from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
-                         DEFAULT_IMAGE_TOKEN, IMAGE_TOKEN_INDEX)
-from model.FSVLM import FSVLMForCausalLM
+from torch.utils.data import DataLoader
+from transformers import BitsAndBytesConfig
+
 from model.llava import conversation as conversation_lib
-from model.llava.mm_utils import tokenizer_image_token
-from model.segment_anything.utils.transforms import ResizeLongestSide
-import csv
+from utils.dataset import ValDataset, collate_fn, save_mask
 from utils.model_loading import load_fsvlm_model
-from utils.orgin_dataset import load_plantseg_records
 from utils.server_metrics import Evaluator
-from PIL import Image
+from utils.utils import DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN, dict_to_cuda
+
 
 def parse_args(args):
-    parser = argparse.ArgumentParser(description="chat")
+    parser = argparse.ArgumentParser(description="FSVLM test")
     parser.add_argument("--version", default="your weight")
     parser.add_argument(
         "--model_base",
@@ -41,15 +36,13 @@ def parse_args(args):
     )
     parser.add_argument(
         "--precision",
-        default="fp16",
+        default="bf16",
         type=str,
         choices=["fp32", "bf16", "fp16"],
         help="precision for inference",
     )
-    parser.add_argument("--encode_type", default="clip-vit")
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
-    parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument(
         "--vision-tower", default="openai/clip-vit-large-patch14", type=str
     )
@@ -63,38 +56,23 @@ def parse_args(args):
         type=str,
         choices=["llava_v1", "llava_llama_2"],
     )
+    parser.add_argument("--workers", default=2, type=int)
     return parser.parse_args(args)
-
-
-def preprocess(
-    x,
-    pixel_mean=torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1),
-    pixel_std=torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1),
-    img_size=1024,
-) -> torch.Tensor:
-    """Normalize pixel values and pad to a square input."""
-    # Normalize colors
-    x = (x - pixel_mean) / pixel_std
-    # Pad
-    h, w = x.shape[-2:]
-    padh = img_size - h
-    padw = img_size - w
-    x = F.pad(x, (0, padw, 0, padh))
-    return x
 
 
 def main(args):
     args = parse_args(args)
     os.makedirs(args.vis_save_path, exist_ok=True)
+
     torch_dtype = torch.float32
     if args.precision == "bf16":
         torch_dtype = torch.bfloat16
     elif args.precision == "fp16":
         torch_dtype = torch.half
 
-    kwargs = {}
+    pretrained_kwargs = {}
     if args.load_in_4bit:
-        kwargs.update(
+        pretrained_kwargs.update(
             {
                 "torch_dtype": torch.half,
                 "load_in_4bit": True,
@@ -108,7 +86,7 @@ def main(args):
             }
         )
     elif args.load_in_8bit:
-        kwargs.update(
+        pretrained_kwargs.update(
             {
                 "torch_dtype": torch.half,
                 "quantization_config": BitsAndBytesConfig(
@@ -135,8 +113,8 @@ def main(args):
             "use_fast": False,
         },
         model_base=args.model_base or None,
-        torch_dtype=kwargs.get("torch_dtype", torch_dtype),
-        pretrained_kwargs=kwargs,
+        torch_dtype=pretrained_kwargs.get("torch_dtype", torch_dtype),
+        pretrained_kwargs=pretrained_kwargs,
     )
     tokenizer.pad_token = tokenizer.unk_token
     tokenizer.add_tokens("[SEG]")
@@ -153,172 +131,92 @@ def main(args):
     model.config.pad_token_id = tokenizer.pad_token_id
 
     model.get_model().initialize_vision_modules(model.get_model().config)
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(dtype=torch_dtype)
+    conversation_lib.default_conversation = conversation_lib.conv_templates[
+        args.conv_type
+    ]
 
     if args.precision == "bf16":
         model = model.bfloat16().cuda()
-    elif (
-        args.precision == "fp16" and (not args.load_in_4bit) and (not args.load_in_8bit)
-    ):
-        vision_tower = model.get_model().get_vision_tower()
-        model.model.vision_tower = None
-        
-
-        model_engine = deepspeed.init_inference(
-            model=model,
-            dtype=torch.half,
-            replace_with_kernel_inject=True,
-            replace_method="auto",
-        )
-        model = model_engine.module
-        model.model.vision_tower = vision_tower.half().cuda()
+    elif args.precision == "fp16" and not args.load_in_4bit and not args.load_in_8bit:
+        model = model.half().cuda()
     elif args.precision == "fp32":
         model = model.float().cuda()
-
-    vision_tower = model.get_model().get_vision_tower()
-    vision_tower.to(device=args.local_rank)
-
-    clip_image_processor = CLIPImageProcessor.from_pretrained("openai/clip-vit-large-patch14")
-    transform = ResizeLongestSide(args.image_size)
+    else:
+        model = model.cuda()
 
     model.eval()
 
-    records = load_plantseg_records(
+    test_dataset = ValDataset(
         args.base_dir,
+        tokenizer,
+        args.vision_tower,
         split=args.split,
+        image_size=args.image_size,
         caption_index=args.caption_index,
+        target_name=args.target_name,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=False,
+        collate_fn=lambda batch: collate_fn(
+            batch,
+            tokenizer=tokenizer,
+            conv_type=args.conv_type,
+            use_mm_start_end=args.use_mm_start_end,
+            local_rank=args.local_rank,
+        ),
     )
 
+    evaluator = Evaluator(2)
+    evaluator.reset()
+
     with torch.no_grad():
-        evaluator = Evaluator(2)
-        evaluator.reset()
-        for record in records:
-            image_path = record["image_path"]
-            mask_path = record["mask_path"]
-            text = record["caption"]
-            prompt = f" {text} Please segment the {args.target_name}"
-            prompt = DEFAULT_IMAGE_TOKEN + "\n" + prompt
-            if args.use_mm_start_end:
-                replace_token = (
-                    DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN
-                )
-            prompt = prompt.replace(DEFAULT_IMAGE_TOKEN, replace_token)
+        for input_dict in test_loader:
+            torch.cuda.empty_cache()
+            input_dict = dict_to_cuda(input_dict)
 
-            conv = conversation_lib.conv_templates[args.conv_type].copy()
-            conv.messages = []
-            if not os.path.exists(image_path):
-                print("File not found in {}".format(image_path))
-                continue
-
-            image_np = cv2.imread(image_path)
-            image_np = cv2.cvtColor(image_np, cv2.COLOR_BGR2RGB)
-            original_size_list = [image_np.shape[:2]]
-
-            conv.append_message(conv.roles[0], prompt)
-            conv.append_message(conv.roles[1], "")
-            prompt = conv.get_prompt()
-            image_clip = (
-                clip_image_processor.preprocess(image_np, return_tensors="pt")[
-                    "pixel_values"
-                ][0]
-                .unsqueeze(0)
-                .cuda()
-            )
-
-            if args.precision == "bf16":
-                image_clip = image_clip.bfloat16()
-            elif args.precision == "fp16":
-                image_clip = image_clip.half()
+            if args.precision == "fp16":
+                input_dict["images"] = input_dict["images"].half()
+                input_dict["images_clip"] = input_dict["images_clip"].half()
+            elif args.precision == "bf16":
+                input_dict["images"] = input_dict["images"].bfloat16()
+                input_dict["images_clip"] = input_dict["images_clip"].bfloat16()
             else:
-                image_clip = image_clip.float()
+                input_dict["images"] = input_dict["images"].float()
+                input_dict["images_clip"] = input_dict["images_clip"].float()
 
-            image = transform.apply_image(image_np)
-            resize_list = [image.shape[:2]]
+            output_dict = model(**input_dict)
 
-            image = (
-                preprocess(torch.from_numpy(image).permute(2, 0, 1).contiguous())
-                .unsqueeze(0)
-                .cuda()
-            )
-            if not os.path.exists(mask_path):
-                continue
-            mask = Image.open(mask_path)
-            masks = np.array(mask)
-            masks = masks[np.newaxis, :, :]
-            masks = torch.from_numpy(masks)
-            masks[masks != 0] = 1
-            if args.precision == "bf16":
-                image = image.bfloat16()
-            elif args.precision == "fp16":
-                image = image.half()
-            else:
-                image = image.float()
-
-            input_ids = tokenizer_image_token(prompt, tokenizer, return_tensors="pt")
-            input_ids = input_ids.unsqueeze(0).cuda()
-
-            output_ids, pred_masks = model.evaluate(
-                image_clip,
-                image,
-                input_ids,
-                resize_list,
-                original_size_list,
-                max_new_tokens=512,
-                tokenizer=tokenizer,
-            )
-            output_ids = output_ids[0][output_ids[0] != IMAGE_TOKEN_INDEX]
-            text_output = tokenizer.decode(output_ids, skip_special_tokens=False)
-            text_output = text_output.replace("\n", "").replace("  ", " ")
-            print("text_output: ", text_output)
-
-            masks_list = masks.int()
+            pred_masks = output_dict["pred_masks"]
+            masks_list = output_dict["gt_masks"][0].int()
             output_list = (pred_masks[0] > 0).int()
-
             evaluator.add_batch(masks_list.cpu().numpy(), output_list.cpu().numpy())
             assert len(pred_masks) == 1
-            for i, pred_mask in enumerate(pred_masks):
-                if pred_mask.shape[0] == 0:
-                    continue
+            save_mask(pred_masks, args.vis_save_path, input_dict["image_paths"][0])
 
-                pred_mask = pred_mask.detach().cpu().numpy()[0] > 0
-                stem = os.path.splitext(os.path.basename(image_path))[0]
-
-                save_path = os.path.join(args.vis_save_path, f"{stem}_mask_{i}.png")
-                cv2.imwrite(save_path, pred_mask * 255)
-                print("{} has been saved.".format(save_path))
-
-                save_path = os.path.join(args.vis_save_path, f"{stem}_masked_img_{i}.png")
-                save_img = image_np.copy()
-                save_img[pred_mask] = (
-                    image_np * 0.5
-                    + pred_mask[:, :, None].astype(np.uint8) * np.array([255, 0, 0]) * 0.5
-                )[pred_mask]
-                save_img = cv2.cvtColor(save_img, cv2.COLOR_RGB2BGR)
-                cv2.imwrite(save_path, save_img)
-                print("{} has been saved.".format(save_path))
-
-        metrics = evaluator.compute_metrics()
-        print(
-            "IoU:{IoU:.4f}, Dice:{Dice:.4f}, Recall:{Recall:.4f}, mIoU:{mIoU:.4f}, mACC:{mACC:.4f}".format(
-                **metrics
-            )
+    metrics = evaluator.compute_metrics()
+    print(
+        "IoU:{IoU:.4f}, Dice:{Dice:.4f}, Recall:{Recall:.4f}, mIoU:{mIoU:.4f}, mACC:{mACC:.4f}".format(
+            **metrics
         )
-        os.makedirs(os.path.dirname(args.metrics_path), exist_ok=True)
-        with open(args.metrics_path, mode="w", newline="") as file:
-            writer = csv.writer(file)
-            writer.writerow(["IoU", "Dice", "Recall", "mIoU", "mACC"])
-            writer.writerow(
-                [
-                    metrics["IoU"],
-                    metrics["Dice"],
-                    metrics["Recall"],
-                    metrics["mIoU"],
-                    metrics["mACC"],
-                ]
-            )
+    )
 
-      
+    os.makedirs(os.path.dirname(args.metrics_path), exist_ok=True)
+    with open(args.metrics_path, mode="w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["IoU", "Dice", "Recall", "mIoU", "mACC"])
+        writer.writerow(
+            [
+                metrics["IoU"],
+                metrics["Dice"],
+                metrics["Recall"],
+                metrics["mIoU"],
+                metrics["mACC"],
+            ]
+        )
 
 
 if __name__ == "__main__":
