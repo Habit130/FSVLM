@@ -176,6 +176,38 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
             torch.cuda.empty_cache()
             image_embeddings = torch.cat(image_embeddings_list, 0)
         return image_embeddings
+
+    def _gather_generation_hidden_states(self, generation_outputs):
+        hidden_states = generation_outputs.hidden_states
+        if hidden_states is None:
+            raise ValueError("Generation did not return hidden states.")
+
+        if isinstance(hidden_states, tuple) and len(hidden_states) > 0:
+            first_item = hidden_states[0]
+            if isinstance(first_item, tuple):
+                pieces = []
+                for step_idx, step_hidden_states in enumerate(hidden_states):
+                    if not step_hidden_states:
+                        continue
+                    step_last_hidden = step_hidden_states[-1]
+                    if step_last_hidden is None:
+                        continue
+                    if step_idx == 0:
+                        pieces.append(step_last_hidden)
+                    else:
+                        pieces.append(step_last_hidden[:, -1:, :])
+                if not pieces:
+                    raise ValueError("Generation hidden states were empty.")
+                return torch.cat(pieces, dim=1)
+
+            if torch.is_tensor(hidden_states[-1]):
+                return hidden_states[-1]
+
+        if torch.is_tensor(hidden_states):
+            return hidden_states
+
+        raise TypeError("Unsupported hidden_states format returned by generate().")
+
     def predict(self,points=None,boxes=None,masks=None,text_embeding=None,image_embeddings=None,multimask_output=1):
         (
             sparse_embeddings,
@@ -408,7 +440,7 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
                 output_attentions=True,
             )
             # make_attention_map(outputs,input_ids,tokenizer)
-            output_hidden_states = outputs.hidden_states[-1]
+            output_hidden_states = self._gather_generation_hidden_states(outputs)
             output_ids = outputs.sequences
             # attention_out=Attention_aggregation(outputs.attentions[-1])
             # attention_out=attention_out[:,-1,indices:indices+256].view(16,16)
@@ -428,6 +460,10 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
             hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
 
             last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
+            if last_hidden_state.shape[1] != seg_token_mask.shape[1]:
+                matched_len = min(last_hidden_state.shape[1], seg_token_mask.shape[1])
+                last_hidden_state = last_hidden_state[:, :matched_len, :]
+                seg_token_mask = seg_token_mask[:, :matched_len]
             pred_embeddings = last_hidden_state[seg_token_mask]
 
             seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
