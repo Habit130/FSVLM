@@ -38,6 +38,10 @@ def parse_args(args):
     )
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument("--text_bridge_hidden_dim", default=1024, type=int)
+    parser.add_argument("--text_bridge_num_layers", default=2, type=int)
+    parser.add_argument("--text_bridge_dropout", default=0.1, type=float)
+    parser.add_argument("--text_bridge_expansion", default=4, type=int)
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument(
@@ -92,6 +96,10 @@ def main(args):
         "vision_tower": args.vision_tower,
         "vision_pretrained": args.vision_pretrained,
         "use_mm_start_end": args.use_mm_start_end,
+        "text_bridge_hidden_dim": args.text_bridge_hidden_dim,
+        "text_bridge_num_layers": args.text_bridge_num_layers,
+        "text_bridge_dropout": args.text_bridge_dropout,
+        "text_bridge_expansion": args.text_bridge_expansion,
     }
 
     torch_dtype = torch.float32

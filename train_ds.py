@@ -99,6 +99,10 @@ def parse_args(args):
         type=str,
     )
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument("--text_bridge_hidden_dim", default=1024, type=int)
+    parser.add_argument("--text_bridge_num_layers", default=2, type=int)
+    parser.add_argument("--text_bridge_dropout", default=0.1, type=float)
+    parser.add_argument("--text_bridge_expansion", default=4, type=int)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--master_port", default=29500, type=int)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -293,6 +297,10 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
+        "text_bridge_hidden_dim": args.text_bridge_hidden_dim,
+        "text_bridge_num_layers": args.text_bridge_num_layers,
+        "text_bridge_dropout": args.text_bridge_dropout,
+        "text_bridge_expansion": args.text_bridge_expansion,
     }
 
     tokenizer, model = load_fsvlm_model(

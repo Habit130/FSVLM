@@ -34,6 +34,11 @@ def parse_args(args):
         default="PATH_TO_SAM_ViT-H/sam_vit_h_4b8939.pth",
         type=str,
     )
+    parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument("--text_bridge_hidden_dim", default=1024, type=int)
+    parser.add_argument("--text_bridge_num_layers", default=2, type=int)
+    parser.add_argument("--text_bridge_dropout", default=0.1, type=float)
+    parser.add_argument("--text_bridge_expansion", default=4, type=int)
     parser.add_argument(
         "--precision",
         default="bf16",
@@ -103,8 +108,12 @@ def main(args):
             "seg_token_idx": 0,
             "vision_pretrained": args.vision_pretrained,
             "train_mask_decoder": True,
-            "out_dim": 256,
+            "out_dim": args.out_dim,
             "use_mm_start_end": args.use_mm_start_end,
+            "text_bridge_hidden_dim": args.text_bridge_hidden_dim,
+            "text_bridge_num_layers": args.text_bridge_num_layers,
+            "text_bridge_dropout": args.text_bridge_dropout,
+            "text_bridge_expansion": args.text_bridge_expansion,
         },
         tokenizer_kwargs={
             "cache_dir": None,

@@ -12,6 +12,70 @@ from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
 import cv2
+
+
+class ResidualMLPBlock(nn.Module):
+    def __init__(self, dim: int, expansion: int = 4, dropout: float = 0.1):
+        super().__init__()
+        hidden_dim = dim * expansion
+        self.norm = nn.LayerNorm(dim)
+        self.fc1 = nn.Linear(dim, hidden_dim)
+        self.act = nn.GELU()
+        self.dropout1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, dim)
+        self.dropout2 = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.dropout1(x)
+        x = self.fc2(x)
+        x = self.dropout2(x)
+        return residual + x
+
+
+class TextBridgeProjector(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        num_layers: int = 2,
+        expansion: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(in_dim)
+        self.input_proj = nn.Linear(in_dim, hidden_dim)
+        self.input_act = nn.GELU()
+        self.input_dropout = nn.Dropout(dropout)
+        self.blocks = nn.ModuleList(
+            [
+                ResidualMLPBlock(
+                    dim=hidden_dim,
+                    expansion=expansion,
+                    dropout=dropout,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_proj = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_norm(x)
+        x = self.input_proj(x)
+        x = self.input_act(x)
+        x = self.input_dropout(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.output_norm(x)
+        x = self.output_proj(x)
+        return x
+
+
 def masks_noise(masks):
 	def get_incoherent_mask(input_masks, sfact):
 		mask = input_masks.float()
@@ -85,13 +149,39 @@ class FSVLMMetaModel:
         super(FSVLMMetaModel, self).__init__(config)
 
         self.config = config
-        if not hasattr(self.config, "train_mask_decoder"):
-            self.config.train_mask_decoder = kwargs["train_mask_decoder"]
-            self.config.out_dim = kwargs["out_dim"]
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
-        else:
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        has_fsvlm_config = hasattr(self.config, "train_mask_decoder")
+        self._init_fsvlm_config(kwargs)
+        if has_fsvlm_config:
             self.initialize_fsvlm_modules(self.config)
+
+    def _init_fsvlm_config(self, kwargs):
+        self.config.train_mask_decoder = getattr(
+            self.config, "train_mask_decoder", kwargs.get("train_mask_decoder", True)
+        )
+        self.config.out_dim = getattr(
+            self.config, "out_dim", kwargs.get("out_dim", 256)
+        )
+        self.config.text_bridge_hidden_dim = getattr(
+            self.config,
+            "text_bridge_hidden_dim",
+            kwargs.get("text_bridge_hidden_dim", 1024),
+        )
+        self.config.text_bridge_num_layers = getattr(
+            self.config,
+            "text_bridge_num_layers",
+            kwargs.get("text_bridge_num_layers", 2),
+        )
+        self.config.text_bridge_dropout = getattr(
+            self.config,
+            "text_bridge_dropout",
+            kwargs.get("text_bridge_dropout", 0.1),
+        )
+        self.config.text_bridge_expansion = getattr(
+            self.config,
+            "text_bridge_expansion",
+            kwargs.get("text_bridge_expansion", 4),
+        )
+        self.vision_pretrained = kwargs.get("vision_pretrained", None)
 
     def initialize_fsvlm_modules(self, config):
         # SAM即视觉编码加mask生成，前者冻结后者可训练
@@ -106,13 +196,19 @@ class FSVLMMetaModel:
         # Projection layer，MLP初始化可训练
         in_dim = config.hidden_size
         out_dim = config.out_dim
-        text_fc = [
-            nn.Linear(in_dim, in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, out_dim),
-            nn.Dropout(0.0),
-        ]
-        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+        bridge_hidden_dim = config.text_bridge_hidden_dim
+        bridge_num_layers = config.text_bridge_num_layers
+        bridge_dropout = config.text_bridge_dropout
+        bridge_expansion = config.text_bridge_expansion
+        text_fc = TextBridgeProjector(
+            in_dim=in_dim,
+            hidden_dim=bridge_hidden_dim,
+            out_dim=out_dim,
+            num_layers=bridge_num_layers,
+            expansion=bridge_expansion,
+            dropout=bridge_dropout,
+        )
+        self.text_hidden_fcs = nn.ModuleList([text_fc])
         self.text_hidden_fcs.train()
         for param in self.text_hidden_fcs.parameters():
             param.requires_grad = True
