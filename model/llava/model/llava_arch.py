@@ -121,10 +121,21 @@ class LlavaMetaForCausalLM(ABC):
                 past_length = self._get_past_length(past_key_values)
                 if past_length is None:
                     return input_ids, attention_mask, past_key_values, None, labels
+                mask_batch = (
+                    attention_mask.shape[0]
+                    if attention_mask is not None
+                    else input_ids.shape[0]
+                )
+                mask_dtype = (
+                    attention_mask.dtype if attention_mask is not None else torch.long
+                )
+                mask_device = (
+                    attention_mask.device if attention_mask is not None else input_ids.device
+                )
                 attention_mask = torch.ones(
-                    (attention_mask.shape[0], past_length + 1),
-                    dtype=attention_mask.dtype,
-                    device=attention_mask.device,
+                    (mask_batch, past_length + 1),
+                    dtype=mask_dtype,
+                    device=mask_device,
                 )
             return input_ids, attention_mask, past_key_values, None, labels
 
