@@ -35,6 +35,15 @@ def parse_args(args):
         type=str,
     )
     parser.add_argument(
+        "--bridge_type",
+        default="mlp",
+        type=str,
+        choices=["mlp", "query"],
+    )
+    parser.add_argument("--bridge_dim", default=256, type=int)
+    parser.add_argument("--bridge_num_queries", default=4, type=int)
+    parser.add_argument("--bridge_num_heads", default=8, type=int)
+    parser.add_argument(
         "--precision",
         default="bf16",
         type=str,
@@ -105,6 +114,10 @@ def main(args):
             "train_mask_decoder": True,
             "out_dim": 256,
             "use_mm_start_end": args.use_mm_start_end,
+            "bridge_type": args.bridge_type,
+            "bridge_dim": args.bridge_dim,
+            "bridge_num_queries": args.bridge_num_queries,
+            "bridge_num_heads": args.bridge_num_heads,
         },
         tokenizer_kwargs={
             "cache_dir": None,

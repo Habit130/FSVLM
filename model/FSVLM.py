@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,7 @@ from utils.utils import (DEFAULT_IM_END_TOKEN, DEFAULT_IM_START_TOKEN,
 from .llava.model.language_model.llava_llama import (LlavaLlamaForCausalLM,
                                                      LlavaLlamaModel)
 from .segment_anything import build_sam_vit_h
+from .segment_anything.modeling.transformer import Attention as SamAttention
 import cv2
 def masks_noise(masks):
 	def get_incoherent_mask(input_masks, sfact):
@@ -76,6 +77,79 @@ def sigmoid_ce_loss(
     return loss
 
 
+class SegQueryBridge(nn.Module):
+    def __init__(
+        self,
+        llm_dim: int,
+        sam_dim: int,
+        out_dim: int,
+        bridge_dim: int,
+        num_queries: int,
+        num_heads: int,
+    ):
+        super().__init__()
+        if bridge_dim % num_heads != 0:
+            raise ValueError(
+                "bridge_dim must be divisible by num_heads, got {} and {}.".format(
+                    bridge_dim, num_heads
+                )
+            )
+
+        self.out_dim = out_dim
+        self.bridge_dim = bridge_dim
+        self.num_queries = num_queries
+        self.query_proj = nn.Linear(llm_dim, num_queries * bridge_dim)
+        self.query_norm = nn.LayerNorm(bridge_dim)
+        self.sam_proj = nn.Linear(sam_dim, bridge_dim)
+        self.sam_norm = nn.LayerNorm(bridge_dim)
+        self.cross_attn = SamAttention(bridge_dim, num_heads)
+        self.out_norm = nn.LayerNorm(bridge_dim)
+        self.out_proj = nn.Sequential(
+            nn.Linear(bridge_dim, bridge_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(bridge_dim, out_dim),
+            nn.Dropout(0.0),
+        )
+
+    def forward(self, h_seg: torch.Tensor, sam_feat: torch.Tensor) -> torch.Tensor:
+        if h_seg.shape[0] == 0:
+            return h_seg.new_zeros((0, self.out_dim))
+
+        # h_seg comes from the existing <SEG> token selection logic in the LLM.
+        queries = self.query_proj(h_seg).view(
+            h_seg.shape[0], self.num_queries, self.bridge_dim
+        )
+        queries = self.query_norm(queries)
+
+        # Use SAM image encoder features instead of LLaVA/CLIP visual features so
+        # the bridge queries the same visual space that the SAM prompt branch uses.
+        if sam_feat.dim() == 4:
+            # [1, C, H, W] -> [1, H * W, C], keeping the SAM spatial order.
+            sam_feat = sam_feat.flatten(2).permute(0, 2, 1)
+        elif sam_feat.dim() != 3:
+            raise ValueError(
+                "sam_feat must be [B, C, H, W] or [B, N, C], got {} dims.".format(
+                    sam_feat.dim()
+                )
+            )
+
+        memory = self.sam_proj(sam_feat)
+        memory = self.sam_norm(memory)
+        if memory.shape[0] == 1:
+            memory = memory.expand(h_seg.shape[0], -1, -1)
+        elif memory.shape[0] != h_seg.shape[0]:
+            raise ValueError(
+                "SAM memory batch {} does not match query batch {}.".format(
+                    memory.shape[0], h_seg.shape[0]
+                )
+            )
+
+        attn_out = self.cross_attn(q=queries, k=memory, v=memory)
+        queries = self.out_norm(queries + attn_out)
+        pooled_queries = queries.mean(dim=1)
+        return self.out_proj(pooled_queries)
+
+
 class FSVLMMetaModel:
     def __init__(
         self,
@@ -85,12 +159,29 @@ class FSVLMMetaModel:
         super(FSVLMMetaModel, self).__init__(config)
 
         self.config = config
-        if not hasattr(self.config, "train_mask_decoder"):
-            self.config.train_mask_decoder = kwargs["train_mask_decoder"]
-            self.config.out_dim = kwargs["out_dim"]
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
-        else:
-            self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        has_fsvlm_config = hasattr(self.config, "train_mask_decoder")
+        train_mask_decoder = kwargs.get(
+            "train_mask_decoder", getattr(self.config, "train_mask_decoder", None)
+        )
+        out_dim = kwargs.get("out_dim", getattr(self.config, "out_dim", None))
+        self.config.train_mask_decoder = getattr(
+            self.config, "train_mask_decoder", train_mask_decoder
+        )
+        self.config.out_dim = getattr(self.config, "out_dim", out_dim)
+        self.config.bridge_type = getattr(
+            self.config, "bridge_type", kwargs.get("bridge_type", "mlp")
+        )
+        self.config.bridge_dim = getattr(
+            self.config, "bridge_dim", kwargs.get("bridge_dim", self.config.out_dim)
+        )
+        self.config.bridge_num_queries = getattr(
+            self.config, "bridge_num_queries", kwargs.get("bridge_num_queries", 4)
+        )
+        self.config.bridge_num_heads = getattr(
+            self.config, "bridge_num_heads", kwargs.get("bridge_num_heads", 8)
+        )
+        self.vision_pretrained = kwargs.get("vision_pretrained", None)
+        if has_fsvlm_config:
             self.initialize_fsvlm_modules(self.config)
 
     def initialize_fsvlm_modules(self, config):
@@ -106,16 +197,33 @@ class FSVLMMetaModel:
         # Projection layer，MLP初始化可训练
         in_dim = config.hidden_size
         out_dim = config.out_dim
-        text_fc = [
-            nn.Linear(in_dim, in_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(in_dim, out_dim),
-            nn.Dropout(0.0),
-        ]
-        self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
-        self.text_hidden_fcs.train()
-        for param in self.text_hidden_fcs.parameters():
-            param.requires_grad = True
+        self.text_hidden_fcs = None
+        self.query_bridge = None
+        if config.bridge_type == "mlp":
+            text_fc = [
+                nn.Linear(in_dim, in_dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(in_dim, out_dim),
+                nn.Dropout(0.0),
+            ]
+            self.text_hidden_fcs = nn.ModuleList([nn.Sequential(*text_fc)])
+            self.text_hidden_fcs.train()
+            for param in self.text_hidden_fcs.parameters():
+                param.requires_grad = True
+        elif config.bridge_type == "query":
+            self.query_bridge = SegQueryBridge(
+                llm_dim=in_dim,
+                sam_dim=self.visual_model.prompt_encoder.embed_dim,
+                out_dim=out_dim,
+                bridge_dim=config.bridge_dim,
+                num_queries=config.bridge_num_queries,
+                num_heads=config.bridge_num_heads,
+            )
+            self.query_bridge.train()
+            for param in self.query_bridge.parameters():
+                param.requires_grad = True
+        else:
+            raise ValueError("Unsupported bridge_type: {}".format(config.bridge_type))
 
 
 class FSVLMModel(FSVLMMetaModel, LlavaLlamaModel):
@@ -207,6 +315,65 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
             return hidden_states
 
         raise TypeError("Unsupported hidden_states format returned by generate().")
+
+    def _build_seg_prompt_embeddings(
+        self,
+        last_hidden_state: torch.Tensor,
+        seg_token_mask: torch.Tensor,
+        image_embeddings: torch.Tensor,
+        offset: Optional[torch.LongTensor] = None,
+    ) -> List[torch.Tensor]:
+        if last_hidden_state.shape[1] != seg_token_mask.shape[1]:
+            matched_len = min(last_hidden_state.shape[1], seg_token_mask.shape[1])
+            last_hidden_state = last_hidden_state[:, :matched_len, :]
+            seg_token_mask = seg_token_mask[:, :matched_len]
+
+        if offset is None:
+            if image_embeddings.shape[0] != last_hidden_state.shape[0]:
+                raise ValueError(
+                    "offset is required when image batch {} does not match sequence batch {}.".format(
+                        image_embeddings.shape[0], last_hidden_state.shape[0]
+                    )
+                )
+            offset = torch.arange(
+                0,
+                last_hidden_state.shape[0] + 1,
+                device=last_hidden_state.device,
+                dtype=torch.long,
+            )
+
+        pred_embeddings = []
+        bridge_type = self.model.config.bridge_type
+        offset_list = offset.tolist()
+        for image_idx, (start_i, end_i) in enumerate(
+            zip(offset_list[:-1], offset_list[1:])
+        ):
+            seq_hidden = last_hidden_state[start_i:end_i]
+            seq_mask = seg_token_mask[start_i:end_i]
+
+            if bridge_type == "mlp":
+                if self.model.text_hidden_fcs is None:
+                    raise RuntimeError("MLP bridge is not initialized.")
+                prompt_hidden = self.model.text_hidden_fcs[0](seq_hidden)
+                pred_embeddings.append(prompt_hidden[seq_mask])
+                continue
+
+            if bridge_type != "query":
+                raise ValueError("Unsupported bridge_type: {}".format(bridge_type))
+            if self.model.query_bridge is None:
+                raise RuntimeError("Query bridge is not initialized.")
+
+            # Keep the <SEG> selection unchanged, then let all <SEG> tokens of the
+            # same image attend to the shared SAM image encoder memory in parallel.
+            h_seg = seq_hidden[seq_mask]
+            pred_embeddings.append(
+                self.model.query_bridge(
+                    h_seg=h_seg,
+                    sam_feat=image_embeddings[image_idx].unsqueeze(0),
+                )
+            )
+
+        return pred_embeddings
 
     def predict(self,points=None,boxes=None,masks=None,text_embeding=None,image_embeddings=None,multimask_output=1):
         (
@@ -316,28 +483,12 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
           
             output_hidden_states = output.hidden_states
 
-        hidden_states = []
-
-        assert len(self.model.text_hidden_fcs) == 1
-        hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states[-1]))
-        last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-        
-        pred_embeddings = last_hidden_state[seg_token_mask]
-        seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-
-        seg_token_offset = seg_token_counts.cumsum(-1)
-        seg_token_offset = torch.cat(
-            [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
+        pred_embeddings = self._build_seg_prompt_embeddings(
+            last_hidden_state=output_hidden_states[-1],
+            seg_token_mask=seg_token_mask,
+            image_embeddings=image_embeddings,
+            offset=offset,
         )
-
-        seg_token_offset = seg_token_offset[offset]
-
-        pred_embeddings_ = []
-        for i in range(len(seg_token_offset) - 1):
-            start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-            pred_embeddings_i=pred_embeddings[start_i:end_i]
-            pred_embeddings_.append(pred_embeddings_i)
-        pred_embeddings = pred_embeddings_
 
         multimask_output = False
         pred_masks = []
@@ -455,30 +606,12 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
                 ],
                 dim=1,
             )
-            hidden_states = [] 
-            assert len(self.model.text_hidden_fcs) == 1
-            hidden_states.append(self.model.text_hidden_fcs[0](output_hidden_states))
-
-            last_hidden_state = torch.stack(hidden_states, dim=-1).sum(dim=-1)
-            if last_hidden_state.shape[1] != seg_token_mask.shape[1]:
-                matched_len = min(last_hidden_state.shape[1], seg_token_mask.shape[1])
-                last_hidden_state = last_hidden_state[:, :matched_len, :]
-                seg_token_mask = seg_token_mask[:, :matched_len]
-            pred_embeddings = last_hidden_state[seg_token_mask]
-
-            seg_token_counts = seg_token_mask.int().sum(-1)  # [bs, ]
-            seg_token_offset = seg_token_counts.cumsum(-1)
-            seg_token_offset = torch.cat(
-                [torch.zeros(1).long().cuda(), seg_token_offset], dim=0
-            )
-
-            pred_embeddings_ = []
-            for i in range(len(seg_token_offset) - 1):
-                start_i, end_i = seg_token_offset[i], seg_token_offset[i + 1]
-                pred_embeddings_.append(pred_embeddings[start_i:end_i])
-            pred_embeddings = pred_embeddings_
-
             image_embeddings = self.get_visual_embs(images)
+            pred_embeddings = self._build_seg_prompt_embeddings(
+                last_hidden_state=output_hidden_states,
+                seg_token_mask=seg_token_mask,
+                image_embeddings=image_embeddings,
+            )
 
             multimask_output = False
             pred_masks = []

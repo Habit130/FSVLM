@@ -99,6 +99,15 @@ def parse_args(args):
         type=str,
     )
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument(
+        "--bridge_type",
+        default="mlp",
+        type=str,
+        choices=["mlp", "query"],
+    )
+    parser.add_argument("--bridge_dim", default=256, type=int)
+    parser.add_argument("--bridge_num_queries", default=4, type=int)
+    parser.add_argument("--bridge_num_heads", default=8, type=int)
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--master_port", default=29500, type=int)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -293,6 +302,10 @@ def main(args):
         "vision_pretrained": args.vision_pretrained,
         "vision_tower": args.vision_tower,
         "use_mm_start_end": args.use_mm_start_end,
+        "bridge_type": args.bridge_type,
+        "bridge_dim": args.bridge_dim,
+        "bridge_num_queries": args.bridge_num_queries,
+        "bridge_num_heads": args.bridge_num_heads,
     }
 
     tokenizer, model = load_fsvlm_model(
@@ -361,6 +374,7 @@ def main(args):
                                 "vision_tower",
                                 "mm_projector",
                                 "text_hidden_fcs",
+                                "query_bridge",
                             ]
                         ]
                     )
@@ -395,7 +409,13 @@ def main(args):
         if any(
             [
                 x in n
-                for x in ["lm_head", "embed_tokens", "mask_decoder", "text_hidden_fcs"]
+                for x in [
+                    "lm_head",
+                    "embed_tokens",
+                    "mask_decoder",
+                    "text_hidden_fcs",
+                    "query_bridge",
+                ]
             ]
         ):
             print("n: ", n, "p.shape: ", p.shape)

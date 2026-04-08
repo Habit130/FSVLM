@@ -38,6 +38,15 @@ def parse_args(args):
     )
     parser.add_argument("--vision_pretrained", default="PATH_TO_SAM_ViT-H", type=str)
     parser.add_argument("--out_dim", default=256, type=int)
+    parser.add_argument(
+        "--bridge_type",
+        default="mlp",
+        type=str,
+        choices=["mlp", "query"],
+    )
+    parser.add_argument("--bridge_dim", default=256, type=int)
+    parser.add_argument("--bridge_num_queries", default=4, type=int)
+    parser.add_argument("--bridge_num_heads", default=8, type=int)
     parser.add_argument("--image_size", default=1024, type=int, help="image size")
     parser.add_argument("--model_max_length", default=512, type=int)
     parser.add_argument(
@@ -92,6 +101,10 @@ def main(args):
         "vision_tower": args.vision_tower,
         "vision_pretrained": args.vision_pretrained,
         "use_mm_start_end": args.use_mm_start_end,
+        "bridge_type": args.bridge_type,
+        "bridge_dim": args.bridge_dim,
+        "bridge_num_queries": args.bridge_num_queries,
+        "bridge_num_heads": args.bridge_num_heads,
     }
 
     torch_dtype = torch.float32
@@ -140,6 +153,7 @@ def main(args):
                                 "vision_tower",
                                 "mm_projector",
                                 "text_hidden_fcs",
+                                "query_bridge",
                             ]
                         ]
                     )
