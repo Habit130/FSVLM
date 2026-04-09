@@ -44,6 +44,12 @@ def parse_args(args):
     parser.add_argument("--bridge_num_queries", default=4, type=int)
     parser.add_argument("--bridge_num_heads", default=8, type=int)
     parser.add_argument(
+        "--bridge_pool_mode",
+        default="tokenwise",
+        type=str,
+        choices=["mean", "tokenwise"],
+    )
+    parser.add_argument(
         "--precision",
         default="bf16",
         type=str,
@@ -118,6 +124,7 @@ def main(args):
             "bridge_dim": args.bridge_dim,
             "bridge_num_queries": args.bridge_num_queries,
             "bridge_num_heads": args.bridge_num_heads,
+            "bridge_pool_mode": args.bridge_pool_mode,
         },
         tokenizer_kwargs={
             "cache_dir": None,

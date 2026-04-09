@@ -112,8 +112,13 @@ class SegQueryBridge(nn.Module):
         )
 
     def forward(self, h_seg: torch.Tensor, sam_feat: torch.Tensor) -> torch.Tensor:
+        pool_mode = getattr(self, "pool_mode", "tokenwise")
         if h_seg.shape[0] == 0:
-            return h_seg.new_zeros((0, self.out_dim))
+            if pool_mode == "mean":
+                return h_seg.new_zeros((0, self.out_dim))
+            if pool_mode != "tokenwise":
+                raise ValueError("Unsupported bridge_pool_mode: {}".format(pool_mode))
+            return h_seg.new_zeros((0, self.num_queries, self.out_dim))
 
         # h_seg comes from the existing <SEG> token selection logic in the LLM.
         queries = self.query_proj(h_seg).view(
@@ -146,8 +151,11 @@ class SegQueryBridge(nn.Module):
 
         attn_out = self.cross_attn(q=queries, k=memory, v=memory)
         queries = self.out_norm(queries + attn_out)
-        pooled_queries = queries.mean(dim=1)
-        return self.out_proj(pooled_queries)
+        if pool_mode == "mean":
+            return self.out_proj(queries.mean(dim=1))
+        if pool_mode != "tokenwise":
+            raise ValueError("Unsupported bridge_pool_mode: {}".format(pool_mode))
+        return self.out_proj(queries)
 
 
 class FSVLMMetaModel:
@@ -179,6 +187,9 @@ class FSVLMMetaModel:
         )
         self.config.bridge_num_heads = getattr(
             self.config, "bridge_num_heads", kwargs.get("bridge_num_heads", 8)
+        )
+        self.config.bridge_pool_mode = getattr(
+            self.config, "bridge_pool_mode", kwargs.get("bridge_pool_mode", "tokenwise")
         )
         self.vision_pretrained = kwargs.get("vision_pretrained", None)
         if has_fsvlm_config:
@@ -219,6 +230,7 @@ class FSVLMMetaModel:
                 num_queries=config.bridge_num_queries,
                 num_heads=config.bridge_num_heads,
             )
+            self.query_bridge.pool_mode = config.bridge_pool_mode
             self.query_bridge.train()
             for param in self.query_bridge.parameters():
                 param.requires_grad = True
@@ -494,6 +506,9 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
         pred_masks = []
 
         for i in range(len(pred_embeddings)):
+            text_embeds = pred_embeddings[i]
+            if text_embeds.dim() == 2:
+                text_embeds = text_embeds.unsqueeze(1)
             
             (
                 sparse_embeddings,
@@ -502,7 +517,7 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
                 points=None,
                 boxes=None,
                 masks=None,
-                text_embeds=pred_embeddings[i].unsqueeze(1),
+                text_embeds=text_embeds,
             )
             sparse_embeddings = sparse_embeddings.to(pred_embeddings[i].dtype)
             low_res_masks, iou_predictions = self.model.visual_model.mask_decoder(
@@ -617,7 +632,10 @@ class FSVLMForCausalLM(LlavaLlamaForCausalLM):
             pred_masks = []
             for i in range(len(pred_embeddings)):
                 point=None
-                low_res_masks,iou_predictions=self.predict(points=point,text_embeding=pred_embeddings[i].unsqueeze(1),
+                text_embeds = pred_embeddings[i]
+                if text_embeds.dim() == 2:
+                    text_embeds = text_embeds.unsqueeze(1)
+                low_res_masks,iou_predictions=self.predict(points=point,text_embeding=text_embeds,
                                                                  image_embeddings=image_embeddings[i].unsqueeze(0),multimask_output=multimask_output)
                 
                 pred_mask = self.model.visual_model.postprocess_masks(

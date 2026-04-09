@@ -108,6 +108,12 @@ def parse_args(args):
     parser.add_argument("--bridge_dim", default=256, type=int)
     parser.add_argument("--bridge_num_queries", default=4, type=int)
     parser.add_argument("--bridge_num_heads", default=8, type=int)
+    parser.add_argument(
+        "--bridge_pool_mode",
+        default="tokenwise",
+        type=str,
+        choices=["mean", "tokenwise"],
+    )
     parser.add_argument("--resume", default="", type=str)
     parser.add_argument("--master_port", default=29500, type=int)
     parser.add_argument("--print_freq", default=1, type=int)
@@ -306,6 +312,7 @@ def main(args):
         "bridge_dim": args.bridge_dim,
         "bridge_num_queries": args.bridge_num_queries,
         "bridge_num_heads": args.bridge_num_heads,
+        "bridge_pool_mode": args.bridge_pool_mode,
     }
 
     tokenizer, model = load_fsvlm_model(
